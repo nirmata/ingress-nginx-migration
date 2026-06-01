@@ -1,0 +1,200 @@
+# Phase 2 — Migrate PoC patterns A–D (F5 NGINX Ingress Controller).
+# Apply AFTER audit policy reports are reviewed:
+#   kubectl apply -f kyverno/01-migrate-ingress-nginx-poc.yaml
+#
+# Opt-in: only Ingresses with label migration.nginx.org/poc=enabled are mutated/generated.
+# Tune nicConfigMapName / nicConfigMapNamespace for your NIC Helm install.
+#
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ingress-nginx-migrate-poc
+  annotations:
+    policies.kyverno.io/title: ingress-nginx → F5 NGINX Ingress PoC migration (A–D)
+    policies.kyverno.io/category: Migration
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Pattern A: mutate 1:1 annotation (ssl-redirect → nginx.org/redirect-to-https).
+      Pattern B: generate/sync NIC controller ConfigMap (proxy-body-size).
+      Pattern C: generate Policy basicAuth + mutate nginx.org/policies.
+      Pattern D: generate Policy cors + mutate nginx.org/policies.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    # --- Pattern A: 1:1 annotation (mutate) ---
+    - name: migrate-a-ssl-redirect-to-redirect-to-https
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/ssl-redirect" || "" }}'
+            operator: Equals
+            value: "true"
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              nginx.org/redirect-to-https: "true"
+
+    # --- Pattern B: annotation → controller ConfigMap (generate) ---
+    - name: migrate-b-proxy-body-size-configmap
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/proxy-body-size" || "" }}'
+            operator: NotEquals
+            value: ""
+      generate:
+        apiVersion: v1
+        kind: ConfigMap
+        name: nginx-configuration
+        namespace: nginx-ingress
+        synchronize: true
+        generateExisting: true
+        data:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: kyverno
+              migration.nginx.org/pattern: configmap-b
+          data:
+            client-max-body-size: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/proxy-body-size" }}'
+
+    # --- Pattern C: basic auth → Policy CRD (generate) ---
+    - name: migrate-c-generate-basic-auth-policy
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/auth-type" || "" }}'
+            operator: Equals
+            value: basic
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/auth-secret" || "" }}'
+            operator: NotEquals
+            value: ""
+      generate:
+        apiVersion: k8s.nginx.org/v1
+        kind: Policy
+        name: "{{ request.object.metadata.name }}-basic-auth"
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        generateExisting: true
+        data:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: kyverno
+              migration.nginx.org/pattern: policy-c-basic-auth
+          spec:
+            basicAuth:
+              secret: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/auth-secret" }}'
+              realm: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/auth-realm" || "Authentication Required" }}'
+
+    - name: migrate-c-ingress-nginx-org-policies-basic-auth
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/auth-type" || "" }}'
+            operator: Equals
+            value: basic
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              nginx.org/policies: "{{ request.object.metadata.name }}-basic-auth"
+
+    # --- Pattern D: CORS → Policy CRD (generate + mutate) ---
+    - name: migrate-d-generate-cors-policy
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/enable-cors" || "" }}'
+            operator: Equals
+            value: "true"
+      context:
+        - name: corsOrigin
+          variable:
+            jmesPath: request.object.metadata.annotations."nginx.ingress.kubernetes.io/cors-allow-origin"
+        - name: corsMethods
+          variable:
+            jmesPath: >-
+              split(replace(request.object.metadata.annotations."nginx.ingress.kubernetes.io/cors-allow-methods" || '', ' ', ''), ',')
+        - name: corsHeaders
+          variable:
+            jmesPath: >-
+              split(replace(request.object.metadata.annotations."nginx.ingress.kubernetes.io/cors-allow-headers" || '', ' ', ''), ',')
+        - name: corsCredentials
+          variable:
+            jmesPath: >-
+              request.object.metadata.annotations."nginx.ingress.kubernetes.io/cors-allow-credentials" == 'true'
+      generate:
+        apiVersion: k8s.nginx.org/v1
+        kind: Policy
+        name: "{{ request.object.metadata.name }}-cors"
+        namespace: "{{ request.object.metadata.namespace }}"
+        synchronize: true
+        generateExisting: true
+        data:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: kyverno
+              migration.nginx.org/pattern: policy-d-cors
+          spec:
+            cors:
+              allowOrigin:
+                - "{{ corsOrigin }}"
+              allowMethods: "{{ corsMethods }}"
+              allowHeaders: "{{ corsHeaders }}"
+              allowCredentials: "{{ corsCredentials }}"
+
+    - name: migrate-d-ingress-nginx-org-policies-cors
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+              selector:
+                matchLabels:
+                  migration.nginx.org/poc: enabled
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."nginx.ingress.kubernetes.io/enable-cors" || "" }}'
+            operator: Equals
+            value: "true"
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              nginx.org/policies: "{{ request.object.metadata.name }}-cors"

@@ -1,0 +1,77 @@
+# Phase 1 — Discovery: audit every Ingress and surface ALL annotations in PolicyReports.
+# Apply first, wait for background scan, then apply 01-migrate-ingress-nginx-poc.yaml.
+#
+#   kubectl apply -f kyverno/00-audit-ingress-annotations.yaml
+#   kubectl get policyreport,clusterpolicyreport -A
+#   kubectl get policyreport -n <ns> -o jsonpath='{range .items[*].results[*]}{.rule}{"\t"}{.resources[0].name}{"\t"}{.message}{"\n"}{end}'
+#
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ingress-nginx-annotation-audit
+  annotations:
+    policies.kyverno.io/title: Audit Ingress annotation inventory (ingress-nginx migration)
+    policies.kyverno.io/category: Migration
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/description: >-
+      Emits PolicyReport entries for every Ingress. Messages include the full
+      metadata.annotations map (excluding last-applied-configuration) and a
+      separate entry for nginx.ingress.kubernetes.io/* keys with PoC migration
+      pattern hints (A–D) where applicable.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    # All annotations on every Ingress (cluster-wide inventory).
+    - name: report-all-metadata-annotations
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+      validate:
+        message: >-
+          ingress={{ request.object.metadata.namespace }}/{{ request.object.metadata.name }}
+          all_annotations={{ to_string(object_from_lists(
+            items(request.object.metadata.annotations || `{}`, 'key', 'value')
+              [?!(regex_match('^kubectl\\.kubernetes\\.io/last-applied-configuration$', @.key))].key,
+            items(request.object.metadata.annotations || `{}`, 'key', 'value')
+              [?!(regex_match('^kubectl\\.kubernetes\\.io/last-applied-configuration$', @.key))].value
+          )) }}
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.name }}"
+                operator: NotEquals
+                value: ""
+
+    # ingress-nginx prefix only + which PoC migration pattern applies.
+    - name: report-ingress-nginx-annotations-and-pattern
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+      preconditions:
+        all:
+          - key: >-
+              {{ request.object.metadata.annotations.keys(@)[?starts_with(@, 'nginx.ingress.kubernetes.io/')] | length(@) }}
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          ingress={{ request.object.metadata.namespace }}/{{ request.object.metadata.name }}
+          ingress_nginx_annotations={{ to_string(object_from_lists(
+            items(request.object.metadata.annotations || `{}`, 'key', 'value')
+              [?starts_with(@.key, 'nginx.ingress.kubernetes.io/')].key,
+            items(request.object.metadata.annotations || `{}`, 'key', 'value')
+              [?starts_with(@.key, 'nginx.ingress.kubernetes.io/')].value
+          )) }}
+          migration_hints=A=ssl-redirect(1:1 mutate); B=proxy-body-size(ConfigMap generate); C=auth-type/basic(Policy generate+mutate); D=enable-cors(Policy generate+mutate)
+          next_step=Label migration.nginx.org/poc=enabled then apply kyverno/01-migrate-ingress-nginx-poc.yaml
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.name }}"
+                operator: NotEquals
+                value: ""
