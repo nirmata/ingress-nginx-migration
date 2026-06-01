@@ -69,7 +69,6 @@ kubectl apply -f kyverno/01-migrate-ingress-nginx-poc.yaml
 ## Limits (PoC)
 
 - Pattern **B** writes a **shared** controller ConfigMap; multiple Ingresses with different `proxy-body-size` values will converge on one value (production needs a conflict strategy).
-- Pattern **D** splits comma-separated CORS lists; avoid spaces after commas in annotations (see `ingress-demo-d.yaml`).
 - Not a full catalog of 130+ annotations — extend rules using audit PolicyReports as inventory input.
 
 ## References
